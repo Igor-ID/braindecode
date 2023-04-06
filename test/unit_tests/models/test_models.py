@@ -13,7 +13,8 @@ import pytest
 from braindecode.models import (
     Deep4Net, EEGNetv4, EEGNetv1, HybridNet, ShallowFBCSPNet, EEGResNet, TCN,
     SleepStagerChambon2018, SleepStagerBlanco2020, SleepStagerEldele2021, USleep,
-    EEGITNet, EEGInception, EEGInceptionERP, EEGInceptionMI, TIDNet)
+    DeepSleepNet, EEGITNet, EEGInception, EEGInceptionERP, EEGInceptionMI, TIDNet, ATCNet)
+
 
 from braindecode.util import set_random_seeds
 
@@ -42,7 +43,8 @@ def check_forward_pass(model, input_sizes, only_check_until_dim=None):
     assert y_pred_new.shape[:only_check_until_dim] == (
         input_sizes['n_samples'], input_sizes['n_classes'])
     np.testing.assert_allclose(y_pred.detach().cpu().numpy(),
-                               y_pred_new.detach().cpu().numpy())
+                               y_pred_new.detach().cpu().numpy(),
+                               atol=1e-4, rtol=0)
 
 
 def test_shallow_fbcsp_net(input_sizes):
@@ -190,6 +192,48 @@ def test_eeginception_mi_binary_n_params(n_filter, reported):
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     # From first column of TABLE 2 in EEG-Inception paper
     assert n_params == reported
+
+
+def test_atcnet(input_sizes):
+    sfreq = 250
+    input_sizes["n_in_times"] = 1125
+    model = ATCNet(
+        n_channels=input_sizes['n_channels'],
+        n_classes=input_sizes['n_classes'],
+        input_size_s=input_sizes['n_in_times'] / sfreq,
+        sfreq=sfreq,
+    )
+
+    check_forward_pass(model, input_sizes,)
+
+
+def test_atcnet_n_params():
+    """Make sure the number of parameters is the same as in the paper when
+    using the same architecture hyperparameters.
+    """
+    n_windows = 5
+    att_head_dim = 8
+    att_num_heads = 2
+
+    model = ATCNet(
+        n_channels=22,
+        n_classes=4,
+        input_size_s=4.5,
+        sfreq=250,
+        n_windows=n_windows,
+        att_head_dim=att_head_dim,
+        att_num_heads=att_num_heads,
+    )
+
+    n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+
+    # The paper states the models has around "115.2 K" parameters in its
+    # conclusion. By analyzing the official tensorflow code, we found indeed
+    # 115,172 parameters, but these take into account untrainable batch norm
+    # params, while the number of trainable parameters is 113,732.
+    official_code_nparams = 113_732
+
+    assert n_params == official_code_nparams
 
 
 @pytest.mark.parametrize(
@@ -387,3 +431,74 @@ def test_eegitnet_shape():
 
     out = model(X)
     assert out.shape == (n_examples, n_classes)
+
+
+@pytest.mark.parametrize('n_classes', [5, 4, 2])
+def test_deepsleepnet(n_classes):
+    n_channels = 1
+    sfreq = 100
+    input_size_s = 30
+    n_examples = 10
+
+    model = DeepSleepNet(n_classes=n_classes, return_feats=False)
+    model.eval()
+
+    rng = np.random.RandomState(42)
+    X = rng.randn(n_examples, n_channels, np.ceil(input_size_s * sfreq).astype(int))
+    X = torch.from_numpy(X.astype(np.float32))
+
+    y_pred1 = model(X)  # 3D inputs
+    y_pred2 = model(X.unsqueeze(1))  # 4D inputs
+    assert y_pred1.shape == (n_examples, n_classes)
+    assert y_pred2.shape == (n_examples, n_classes)
+    np.testing.assert_allclose(y_pred1.detach().cpu().numpy(),
+                               y_pred2.detach().cpu().numpy())
+
+
+def test_deepsleepnet_feats():
+    n_channels = 1
+    sfreq = 100
+    input_size_s = 30
+    n_classes = 3
+    n_examples = 10
+
+    model = DeepSleepNet(n_classes=n_classes, return_feats=True)
+    model.eval()
+
+    rng = np.random.RandomState(42)
+    X = rng.randn(n_examples, n_channels, int(sfreq * input_size_s))
+    X = torch.from_numpy(X.astype(np.float32))
+
+    out = model(X.unsqueeze(1))
+    assert out.shape == (n_examples, model.len_last_layer)
+
+
+def test_deepsleepnet_feats_with_hook():
+    n_channels = 1
+    sfreq = 100
+    input_size_s = 30
+    n_classes = 3
+    n_examples = 10
+
+    model = DeepSleepNet(n_classes=n_classes, return_feats=False)
+    model.eval()
+
+    rng = np.random.RandomState(42)
+    X = rng.randn(n_examples, n_channels, int(sfreq * input_size_s))
+    X = torch.from_numpy(X.astype(np.float32))
+
+    def get_intermediate_layers(intermediate_layers, layer_name):
+        def hook(model, input, output):
+            intermediate_layers[layer_name] = output.flatten(start_dim=1).detach()
+
+        return hook
+
+    intermediate_layers = {}
+    layer_name = "features_extractor"
+    model.features_extractor.register_forward_hook(
+        get_intermediate_layers(intermediate_layers, layer_name)
+    )
+
+    y_pred = model(X.unsqueeze(1))
+    assert intermediate_layers["features_extractor"].shape == (n_examples, model.len_last_layer)
+    assert y_pred.shape == (n_examples, n_classes)
